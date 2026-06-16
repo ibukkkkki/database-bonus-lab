@@ -151,7 +151,7 @@ int IxNodeHandle::insert(const char *key, const Rid &value) {
     if(idx < get_size() && ix_compare(get_key(idx), key, file_hdr->col_types_, file_hdr->col_lens_) == 0) {
         return get_size();
     }
-    insert_pairs(idx, idx, &value, 1);
+    insert_pairs(idx, key, &value, 1);
     return get_size();
 }
 

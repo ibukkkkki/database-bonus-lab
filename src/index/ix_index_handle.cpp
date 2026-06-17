@@ -98,7 +98,10 @@ page_id_t IxNodeHandle::internal_lookup(const char *key) {
     // 2. 获取该孩子节点（子树）所在页面的编号
     // 3. 返回页面编号
     int idx = upper_bound(key);
-    return value_at(idx);
+    if (idx == 0) {
+        return value_at(0);
+    }
+    return value_at(idx - 1);
 }
 
 /**
@@ -318,6 +321,7 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle *old_node, const char *key, 
     if (old_node->get_parent_page_no() == IX_NO_PAGE) {
         IxNodeHandle *new_root = create_node();
         new_root->page_hdr->is_leaf = false;
+        new_root->page_hdr->parent = IX_NO_PAGE;
         new_root->insert_pair(0, old_node->get_key(0), Rid{old_node->get_page_no(), -1});
         new_root->insert_pair(1, key, Rid{new_node->get_page_no(), -1});
         old_node->set_parent_page_no(new_root->get_page_no());
@@ -358,6 +362,7 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
     if (is_empty()) {
         IxNodeHandle *new_root = create_node();
         new_root->page_hdr->is_leaf = true;
+        new_root->page_hdr->parent = IX_NO_PAGE;
         new_root->insert_pair(0, key, value);
         update_root_page_no(new_root->get_page_no());
         file_hdr_->first_leaf_ = new_root->get_page_no();
@@ -413,6 +418,23 @@ bool IxIndexHandle::delete_entry(const char *key, Transaction *transaction) {
         return false;
     }
     leaf->remove(key);
+    // 如果删除的是节点第一个 key，需要向上更新父节点
+    if (!leaf->is_root_page()) {
+        IxNodeHandle *parent = fetch_node(leaf->get_parent_page_no());
+        int idx = 0;
+        bool found = false;
+        for (; idx < parent->get_size(); idx++) {
+            if (parent->value_at(idx) == leaf->get_page_no()) {
+                found = true;
+                break;
+            }
+        }
+        buffer_pool_manager_->unpin_page(parent->get_page_id(), false);
+        delete parent;
+        if (found) {
+            maintain_parent(leaf);
+        }
+    }
     coalesce_or_redistribute(leaf, transaction, &root_is_latched);
 
     buffer_pool_manager_->unpin_page(leaf->get_page_id(), true);
@@ -455,12 +477,23 @@ bool IxIndexHandle::coalesce_or_redistribute(IxNodeHandle *node, Transaction *tr
     bool need_delete = false;
     if (node->get_size() + sibling_node->get_size() >= node->get_min_size() * 2) {
         redistribute(sibling_node, node, parent, index);
+        buffer_pool_manager_->unpin_page(sibling_node->get_page_id(), true);
+        delete sibling_node;
     } else {
        need_delete = coalesce(&sibling_node, &node, &parent, index, transaction, root_is_latched);
+       // coalesce 不改动指针，右节点页仍需 unpin
+       if (index == 0) {
+           // sibling_node 是右节点（被合并删除的），需要 unpin
+           buffer_pool_manager_->unpin_page(sibling_node->get_page_id(), false);
+           delete sibling_node;
+       } else {
+           // node 是右节点（被合并删除的），sibling_node 是幸存者
+           // node 的 page 由 delete_entry 负责 unpin
+           buffer_pool_manager_->unpin_page(sibling_node->get_page_id(), true);
+           delete sibling_node;
+       }
     }
 
-    buffer_pool_manager_->unpin_page(sibling_node->get_page_id(), true);
-    delete sibling_node;
     buffer_pool_manager_->unpin_page(parent->get_page_id(), true);
     delete parent;
 
@@ -528,10 +561,13 @@ void IxIndexHandle::redistribute(IxNodeHandle *neighbor_node, IxNodeHandle *node
     } else {
         node->insert_pair(node->get_size(), neighbor_node->get_key(0), *neighbor_node->get_rid(0));
         neighbor_node->erase_pair(0);
-        if(!node->is_leaf_page()) {
+        if (!node->is_leaf_page()) {
             maintain_child(node, node->get_size() - 1);
         }
-        parent->set_key(1, neighbor_node->get_key(0));
+        // neighbor 在 rids[index+1]，若 parent->get_size() > 1 则有对应的 key 可更新
+        if (parent->get_size() > 1) {
+            parent->set_key(index + 1, neighbor_node->get_key(0));
+        }
     }
 }
 
@@ -556,34 +592,40 @@ bool IxIndexHandle::coalesce(IxNodeHandle **neighbor_node, IxNodeHandle **node, 
     // 2. 把node结点的键值对移动到neighbor_node中，并更新node结点孩子结点的父节点信息（调用maintain_child函数）
     // 3. 释放和删除node结点，并删除parent中node结点的信息，返回parent是否需要被删除
     // 提示：如果是叶子结点且为最右叶子结点，需要更新file_hdr_.last_leaf
-    if(index == 0) {
-        std::swap(*node, *neighbor_node);
+    IxNodeHandle *left_node, *right_node;
+    if (index == 0) {
+        left_node = *node;
+        right_node = *neighbor_node;
+    } else {
+        left_node = *neighbor_node;
+        right_node = *node;
     }
-    int node_size = (*node)->get_size();
-    int neighbor_size = (*neighbor_node)->get_size();
 
-    (*neighbor_node)->insert_pairs(neighbor_size, (*node)->get_key(0), (*node)->get_rid(0), node_size);
+    int left_size = left_node->get_size();
+    int right_size = right_node->get_size();
 
-    if(!(*neighbor_node)->is_leaf_page()) {
-        for(int i = 0;i < node_size; i++) {
-            maintain_child(*neighbor_node, neighbor_size + i);
+    left_node->insert_pairs(left_size, right_node->get_key(0), right_node->get_rid(0), right_size);
+
+    if (!left_node->is_leaf_page()) {
+        for (int i = 0; i < right_size; i++) {
+            maintain_child(left_node, left_size + i);
         }
     }
 
-    if((*node)->is_leaf_page()) {
-        if((*node)->get_page_no() == file_hdr_->last_leaf_) {
-            file_hdr_->last_leaf_ = (*neighbor_node)->get_page_no();
+    if (right_node->is_leaf_page()) {
+        if (right_node->get_page_no() == file_hdr_->last_leaf_) {
+            file_hdr_->last_leaf_ = left_node->get_page_no();
         }
-        erase_leaf(*node);
+        erase_leaf(right_node);
     }
-    int pos = (*parent)->find_child(*node);
+
+    int pos = (*parent)->find_child(right_node);
     (*parent)->erase_pair(pos);
 
-    release_node_handle(**node);
+    release_node_handle(*right_node);
 
-    buffer_pool_manager_->unpin_page((*node)->get_page_id(), false);
-    delete *node;
-    *node = nullptr;
+    // 不在这里 unpin/delete right_node，由调用方 coalesce_or_redistribute 统一管理
+    // 避免 double-free：right_node 可能是调用方的 sibling_node 或 node 参数
 
     bool need_delete = coalesce_or_redistribute(*parent, transaction, root_is_latched);
     return need_delete;

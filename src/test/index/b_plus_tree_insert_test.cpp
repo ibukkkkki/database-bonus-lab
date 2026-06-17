@@ -65,7 +65,10 @@ class BPlusTreeTests : public ::testing::Test {
         coldef.push_back({"col1", TYPE_INT, 4});
         coldef.push_back({"col2", TYPE_INT, 4});
         sm_->create_table(TEST_FILE_NAME, coldef, nullptr);
-        sm_->create_index(TEST_FILE_NAME, TEST_COL, nullptr);
+        // sm_->create_index(TEST_FILE_NAME, TEST_COL, nullptr);
+        std::vector<ColMeta> index_cols;
+        index_cols.push_back({.tab_name = TEST_FILE_NAME, .name = "col1", .type = TYPE_INT, .len = 4, .offset = 0, .index = 0});
+        ix_manager_->create_index(TEST_FILE_NAME, index_cols);
         assert(ix_manager_->exists(TEST_FILE_NAME, TEST_COL));
         // 打开测试文件
         ih_ = ix_manager_->open_index(TEST_FILE_NAME, TEST_COL);

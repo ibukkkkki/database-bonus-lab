@@ -30,15 +30,15 @@ public:
         sockfd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         if (sockfd_ < 0) throw std::runtime_error("socket failed");
 
-        struct hostent *he = gethostbyname(host.c_str());
-        if (!he) {
+        struct addrinfo hints{}, *res = nullptr;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0) {
             ::close(sockfd_);
-            throw std::runtime_error("gethostbyname failed for " + host);
+            throw std::runtime_error("getaddrinfo failed for " + host);
         }
-        struct sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(port);
-        addr.sin_addr = *(struct in_addr*)he->h_addr;
+        struct sockaddr_in addr = *(struct sockaddr_in *)res->ai_addr;
+        freeaddrinfo(res);
         if (::connect(sockfd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
             ::close(sockfd_);
             throw std::runtime_error("connect failed");

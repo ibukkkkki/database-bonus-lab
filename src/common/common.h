@@ -82,7 +82,10 @@ struct Condition {
     Value rhs_val;    // right-hand side value
 };
 
+enum class SetOpType { ASSIGN, PLUS, MINUS };
+
 struct SetClause {
     TabCol lhs;
     Value rhs;
+    SetOpType op = SetOpType::ASSIGN;
 };

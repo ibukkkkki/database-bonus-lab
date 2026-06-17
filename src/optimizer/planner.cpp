@@ -22,7 +22,8 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "record_printer.h"
 
-// 目前的索引匹配规则为：完全匹配索引字段，且全部为单点查询，不会自动调整where条件的顺序
+// 索引匹配规则：选择可用前缀最长的索引，返回完整索引列名。
+// 执行器会根据完整索引列构造 B+ 树上下界；若只匹配前缀，则自动退化为范围扫描。
 //
 // 【粗糙基线】RucBase 实验框架的 IxIndexHandle/IxNodeHandle 中的 lower_bound/upper_bound/
 //  insert/leaf_lookup/internal_lookup 等核心 API 均为 Lab2 学生作业（默认空实现）。
@@ -36,13 +37,56 @@ bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_c
         return false;
     }
     index_col_names.clear();
-    for(auto& cond: curr_conds) {
-        if(cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.tab_name.compare(tab_name) == 0)
-            index_col_names.push_back(cond.lhs_col.col_name);
-    }
     TabMeta& tab = sm_manager_->db_.get_table(tab_name);
-    if(tab.is_index(index_col_names)) return true;
-    return false;
+
+    std::map<std::string, bool> eq_conds;
+    std::map<std::string, bool> range_conds;
+    for (auto &cond : curr_conds) {
+        if (!cond.is_rhs_val || cond.lhs_col.tab_name.compare(tab_name) != 0) {
+            continue;
+        }
+        if (cond.op == OP_EQ) {
+            eq_conds[cond.lhs_col.col_name] = true;
+        } else if (cond.op == OP_LT || cond.op == OP_LE || cond.op == OP_GT || cond.op == OP_GE) {
+            range_conds[cond.lhs_col.col_name] = true;
+        }
+    }
+
+    const IndexMeta *best_index = nullptr;
+    int best_eq_prefix = -1;
+    int best_usable_prefix = -1;
+    for (auto &index : tab.indexes) {
+        int eq_prefix = 0;
+        int usable_prefix = 0;
+        for (auto &col : index.cols) {
+            if (eq_conds.find(col.name) != eq_conds.end()) {
+                eq_prefix++;
+                usable_prefix++;
+                continue;
+            }
+            if (range_conds.find(col.name) != range_conds.end()) {
+                usable_prefix++;
+            }
+            break;
+        }
+        if (usable_prefix == 0) {
+            continue;
+        }
+        if (usable_prefix > best_usable_prefix ||
+            (usable_prefix == best_usable_prefix && eq_prefix > best_eq_prefix)) {
+            best_index = &index;
+            best_eq_prefix = eq_prefix;
+            best_usable_prefix = usable_prefix;
+        }
+    }
+
+    if (best_index == nullptr) {
+        return false;
+    }
+    for (auto &col : best_index->cols) {
+        index_col_names.push_back(col.name);
+    }
+    return true;
 }
 
 /**
@@ -377,10 +421,12 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
     } else if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(query->parse)) {
 
         std::shared_ptr<plannerInfo> root = std::make_shared<plannerInfo>(x);
+        bool for_update = query->for_update;
         // 生成select语句的查询执行计划
         std::shared_ptr<Plan> projection = generate_select_plan(std::move(query), context);
         plannerRoot = std::make_shared<DMLPlan>(T_select, projection, std::string(), std::vector<Value>(),
-                                                    std::vector<Condition>(), std::vector<SetClause>());
+                                                    std::vector<Condition>(), std::vector<SetClause>(),
+                                                    for_update);
     } else {
         throw InternalError("Unexpected AST root");
     }

@@ -58,7 +58,14 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     // 2. 释放该事务持有的所有锁
     auto lock_set = txn->get_lock_set();
     for (const auto &lock_id : *lock_set) {
-        lock_manager_->unlock(txn, lock_id);
+        if (lock_id.type_ == LockDataType::RECORD) {
+            lock_manager_->unlock(txn, lock_id);
+        }
+    }
+    for (const auto &lock_id : *lock_set) {
+        if (lock_id.type_ == LockDataType::TABLE) {
+            lock_manager_->unlock(txn, lock_id);
+        }
     }
     lock_set->clear();
 
@@ -140,23 +147,40 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
             case WType::UPDATE_TUPLE: {
                 // 回滚 update：先把当前记录的索引删除，再写回旧记录与旧索引
                 auto cur_rec = fh->get_record(rid, nullptr);
-                for (auto &index : tab.indexes) {
-                    auto ih = sm_manager_->ihs_.at(
-                        sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+                std::vector<bool> index_changed(tab.indexes.size(), false);
+                for (size_t i = 0; i < tab.indexes.size(); ++i) {
+                    auto &index = tab.indexes[i];
                     char *cur_key = new char[index.col_tot_len];
+                    char *old_key = new char[index.col_tot_len];
                     int offset = 0;
                     for (size_t j = 0; j < (size_t)index.col_num; ++j) {
                         memcpy(cur_key + offset, cur_rec->data + index.cols[j].offset, index.cols[j].len);
+                        memcpy(old_key + offset,
+                               wr->GetRecord().data + index.cols[j].offset,
+                               index.cols[j].len);
                         offset += index.cols[j].len;
                     }
-                    ih->delete_entry(cur_key, txn);
-                    delete[] cur_key;
-                }
-                fh->update_record(rid, wr->GetRecord().data, nullptr);
-                for (auto &index : tab.indexes) {
+                    if (memcmp(cur_key, old_key, index.col_tot_len) == 0) {
+                        delete[] cur_key;
+                        delete[] old_key;
+                        continue;
+                    }
+                    index_changed[i] = true;
                     auto ih = sm_manager_->ihs_.at(
                         sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+                    ih->delete_entry(cur_key, txn);
+                    delete[] cur_key;
+                    delete[] old_key;
+                }
+                fh->update_record(rid, wr->GetRecord().data, nullptr);
+                for (size_t i = 0; i < tab.indexes.size(); ++i) {
+                    if (!index_changed[i]) {
+                        continue;
+                    }
+                    auto &index = tab.indexes[i];
                     char *old_key = new char[index.col_tot_len];
+                    auto ih = sm_manager_->ihs_.at(
+                        sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
                     int offset = 0;
                     for (size_t j = 0; j < (size_t)index.col_num; ++j) {
                         memcpy(old_key + offset,
@@ -176,7 +200,14 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     // 2. 释放锁
     auto lock_set = txn->get_lock_set();
     for (const auto &lock_id : *lock_set) {
-        lock_manager_->unlock(txn, lock_id);
+        if (lock_id.type_ == LockDataType::RECORD) {
+            lock_manager_->unlock(txn, lock_id);
+        }
+    }
+    for (const auto &lock_id : *lock_set) {
+        if (lock_id.type_ == LockDataType::TABLE) {
+            lock_manager_->unlock(txn, lock_id);
+        }
     }
     lock_set->clear();
 

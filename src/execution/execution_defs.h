@@ -12,3 +12,9 @@ See the Mulan PSL v2 for more details. */
 
 #include "defs.h"
 #include "errors.h"
+
+enum class ScanLockMode {
+    READ,
+    WRITE,
+    NONE,
+};

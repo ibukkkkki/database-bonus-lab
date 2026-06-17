@@ -12,17 +12,10 @@ RMDB is licensed under Mulan PSL v2. ... */
 static const std::string GroupLockModeStr[10] = {"NON_LOCK", "IS", "IX", "S", "X", "SIX"};
 
 /**
- * @brief 表级 S/X 锁 + wait-die 死锁预防（最小可行版本）
+ * @brief 多粒度锁 + wait-die 死锁预防。
  *
- * 设计取舍：
- *   - 只做表锁，不做行锁：对 TPC-C 来说粒度仍然偏粗，但已经能让"读读并发、不同表读写并发"
- *   - 只支持 S（共享）/ X（独占）两种模式，不实现 IS/IX/SIX
- *   - 锁升级：持 S 的事务再请求 X 时，等其它持锁者释放后升级
- *   - 死锁预防：wait-die（老事务可以等，年轻事务直接 abort）
- *   - 严格 2PL：commit/abort 时由 TransactionManager 统一释放
- *
- * 保留 global_lock/global_unlock 仅为兼容旧调用（已改为 no-op），
- * 以及保留行级/IS/IX 接口为 no-op 以避免改动其它调用方。
+ * 表级锁支持 IS / IX / S / X / SIX，行级锁支持 S / X。严格 2PL 仍由
+ * TransactionManager 在 commit/abort 时统一释放。
  */
 class LockManager {
 public:
@@ -43,7 +36,7 @@ public:
     public:
         std::list<LockRequest> request_queue_;
         std::condition_variable cv_;
-        // 当前已授予的锁的"组模式"：NON_LOCK / S / X
+        // 当前已授予的锁的组模式：NON_LOCK / IS / IX / S / X / SIX
         GroupLockMode group_lock_mode_ = GroupLockMode::NON_LOCK;
     };
 
@@ -51,11 +44,11 @@ public:
     LockManager() {}
     ~LockManager() {}
 
-    // ===== 表级 S/X 锁（真正生效）=====
+    // ===== 表级锁 =====
     bool lock_shared_on_table(Transaction* txn, int tab_fd);
     bool lock_exclusive_on_table(Transaction* txn, int tab_fd);
 
-    // ===== 行级锁、IS、IX：保留 no-op，避免影响其它调用方 =====
+    // ===== 行级锁、意向锁 =====
     bool lock_shared_on_record(Transaction* txn, const Rid& rid, int tab_fd);
     bool lock_exclusive_on_record(Transaction* txn, const Rid& rid, int tab_fd);
     bool lock_IS_on_table(Transaction* txn, int tab_fd);
@@ -69,8 +62,14 @@ public:
     void global_unlock() { /* no-op */ }
 
 private:
-    // 内部：表级加锁通用逻辑（mode = S 或 X）
+    bool lock(Transaction* txn, const LockDataId& lock_data_id, LockMode mode);
     bool lock_table(Transaction* txn, int tab_fd, LockMode mode);
+
+    bool is_compatible(LockMode granted, LockMode requested) const;
+    bool is_compatible_with_granted(const LockRequestQueue& queue, txn_id_t txn_id, LockMode requested) const;
+    bool should_abort_by_wait_die(const LockRequestQueue& queue, Transaction* txn, LockMode requested) const;
+    LockMode upgrade_mode(LockMode held, LockMode requested) const;
+    GroupLockMode recompute_group_lock_mode(const LockRequestQueue& queue) const;
 
     std::mutex latch_;                                          // 保护 lock_table_ 自身
     std::unordered_map<LockDataId, LockRequestQueue> lock_table_;

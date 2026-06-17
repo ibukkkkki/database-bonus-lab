@@ -22,7 +22,7 @@ using namespace ast;
 
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
-WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY
+WHERE FOR UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
 
@@ -50,6 +50,7 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_CO
 %type <sv_conds> whereClause optWhereClause
 %type <sv_orderby>  order_clause opt_order_clause
 %type <sv_orderby_dir> opt_asc_desc
+%type <sv_int> opt_for_update
 
 %%
 start:
@@ -144,9 +145,9 @@ dml:
     {
         $$ = std::make_shared<UpdateStmt>($2, $4, $5);
     }
-    |   SELECT selector FROM tableList optWhereClause opt_order_clause
+    |   SELECT selector FROM tableList optWhereClause opt_order_clause opt_for_update
     {
-        $$ = std::make_shared<SelectStmt>($2, $4, $5, $6);
+        $$ = std::make_shared<SelectStmt>($2, $4, $5, $6, $7 != 0);
     }
     ;
 
@@ -210,9 +211,25 @@ value:
     {
         $$ = std::make_shared<IntLit>($1);
     }
+    |   '+' VALUE_INT
+    {
+        $$ = std::make_shared<IntLit>($2);
+    }
+    |   '-' VALUE_INT
+    {
+        $$ = std::make_shared<IntLit>(-$2);
+    }
     |   VALUE_FLOAT
     {
         $$ = std::make_shared<FloatLit>($1);
+    }
+    |   '+' VALUE_FLOAT
+    {
+        $$ = std::make_shared<FloatLit>($2);
+    }
+    |   '-' VALUE_FLOAT
+    {
+        $$ = std::make_shared<FloatLit>(-$2);
     }
     |   VALUE_STRING
     {
@@ -322,14 +339,22 @@ setClause:
     {
         $$ = std::make_shared<SetClause>($1, $3);
     }
-    ;    ;    |   colName '=' colName '+' value
+    |   colName '=' colName '+' value
     {
         // col = col + value (TPC-C 里常见)
+        if ($1 != $3) {
+            yyerror(&@3, "incremental update must use the same column on both sides");
+            YYERROR;
+        }
         $$ = std::make_shared<SetClause>($1, $5, SV_SET_PLUS);
     }
     |   colName '=' colName '-' value
     {
         // col = col - value
+        if ($1 != $3) {
+            yyerror(&@3, "incremental update must use the same column on both sides");
+            YYERROR;
+        }
         $$ = std::make_shared<SetClause>($1, $5, SV_SET_MINUS);
     }
     ;
@@ -362,7 +387,21 @@ opt_order_clause:
     { 
         $$ = $3; 
     }
-    |   /* epsilon */ { /* ignore*/ }
+    |   /* epsilon */
+    {
+        $$ = nullptr;
+    }
+    ;
+
+opt_for_update:
+    FOR UPDATE
+    {
+        $$ = 1;
+    }
+    |   /* epsilon */
+    {
+        $$ = 0;
+    }
     ;
 
 order_clause:

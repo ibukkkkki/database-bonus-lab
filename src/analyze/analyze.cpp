@@ -10,6 +10,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
     std::shared_ptr<Query> query = std::make_shared<Query>();
     if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(parse))
     {
+        query->for_update = x->for_update;
         // 处理表名
         query->tables = std::move(x->tabs);
         // 检查表是否存在
@@ -47,6 +48,11 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         for (auto &sv_set_clause : x->set_clauses) {
             SetClause set_clause = {.lhs = {.tab_name = "", .col_name = sv_set_clause->col_name},
                                     .rhs = convert_sv_value(sv_set_clause->val)};
+            if (sv_set_clause->op == ast::SV_SET_PLUS) {
+                set_clause.op = SetOpType::PLUS;
+            } else if (sv_set_clause->op == ast::SV_SET_MINUS) {
+                set_clause.op = SetOpType::MINUS;
+            }
             query->set_clauses.push_back(set_clause);
         }
         TabMeta &tab = sm_manager_->db_.get_table(x->tab_name);

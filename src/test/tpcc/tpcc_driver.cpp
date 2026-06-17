@@ -4,9 +4,8 @@
  *   ./tpcc_driver -h 127.0.0.1 -p 8765 -w 1 -t 4 -d 60
  *     -t 客户端线程数  -d 测试时长（秒）
  *
- * 实现策略（最粗糙基线）：
- *   - 所有写时算（update col=col±x）由"客户端 SELECT 后再 UPDATE"实现；
- *     由于服务端用全局大锁，单事务内无并发干扰。
+ * 实现策略：
+ *   - 写时算尽量下推为服务端原子增量 UPDATE，减少读后写升级冲突。
  *   - 不实现 Order-Status / Stock-Level 中的 ORDER BY LIMIT 与 COUNT DISTINCT，
  *     改写为客户端扫描后处理。
  *   - 事务边界：BEGIN; ... ; COMMIT;（失败用 ABORT）
@@ -67,7 +66,12 @@ public:
 
         cli_->send_sql("BEGIN;");
 
-        // 1. 取 district 的 d_next_o_id
+        // 1. 提前锁住 district 热点行，避免 SELECT 后 S->X 升级冲突
+        cli_->send_sql(
+            "UPDATE district SET d_next_o_id=d_next_o_id+0 WHERE d_w_id=" + std::to_string(w_id) +
+            " AND d_id=" + std::to_string(d_id) + ";");
+
+        // 2. 取 district 的 d_next_o_id
         auto resp = cli_->send_sql(
             "SELECT d_next_o_id FROM district WHERE d_w_id=" + std::to_string(w_id) +
             " AND d_id=" + std::to_string(d_id) + ";");
@@ -75,24 +79,24 @@ public:
         if (rows.empty()) { cli_->send_sql("ABORT;"); return false; }
         int o_id = std::atoi(rows[0][0].c_str());
 
-        // 2. 自增 d_next_o_id（客户端算后写回）
+        // 3. 自增 d_next_o_id
         cli_->send_sql(
-            "UPDATE district SET d_next_o_id=" + std::to_string(o_id + 1) +
+            std::string("UPDATE district SET d_next_o_id=d_next_o_id+1") +
             " WHERE d_w_id=" + std::to_string(w_id) + " AND d_id=" + std::to_string(d_id) + ";");
 
-        // 3. 写 orders
+        // 4. 写 orders
         cli_->send_sql(
             "INSERT INTO orders VALUES (" +
             std::to_string(o_id) + "," + std::to_string(d_id) + "," +
             std::to_string(w_id) + "," + std::to_string(c_id) + ",0,0," +
             std::to_string(ol_cnt) + ",1);");
 
-        // 4. 写 new_orders
+        // 5. 写 new_orders
         cli_->send_sql(
             "INSERT INTO new_orders VALUES (" +
             std::to_string(o_id) + "," + std::to_string(d_id) + "," + std::to_string(w_id) + ");");
 
-        // 5. 每个 ol：取 stock，扣 quantity，写 order_line
+        // 6. 每个 ol：取 stock，扣 quantity，写 order_line
         for (int ln = 1; ln <= ol_cnt; ++ln) {
             int i_id = rg_.randint(1, n_items_);
             // 取 stock.s_quantity
@@ -129,46 +133,21 @@ public:
 
         cli_->send_sql("BEGIN;");
 
-        // 1. 读 warehouse.w_ytd
-        auto rw = SqlClient::parse_rows(cli_->send_sql(
-            "SELECT w_ytd FROM warehouse WHERE w_id=" + std::to_string(w_id) + ";"));
-        if (rw.empty()) { cli_->send_sql("ABORT;"); return false; }
-        float w_ytd = std::atof(rw[0][0].c_str());
+        // 1. warehouse.w_ytd += amt
         cli_->send_sql(
-            "UPDATE warehouse SET w_ytd=" + std::to_string(w_ytd + amt) +
+            "UPDATE warehouse SET w_ytd=w_ytd+" + std::to_string(amt) +
             " WHERE w_id=" + std::to_string(w_id) + ";");
 
-        // 2. district.d_ytd
-        auto rd = SqlClient::parse_rows(cli_->send_sql(
-            "SELECT d_ytd FROM district WHERE d_w_id=" + std::to_string(w_id) +
-            " AND d_id=" + std::to_string(d_id) + ";"));
-        if (rd.empty()) { cli_->send_sql("ABORT;"); return false; }
-        float d_ytd = std::atof(rd[0][0].c_str());
+        // 2. district.d_ytd += amt
         cli_->send_sql(
-            "UPDATE district SET d_ytd=" + std::to_string(d_ytd + amt) +
+            "UPDATE district SET d_ytd=d_ytd+" + std::to_string(amt) +
             " WHERE d_w_id=" + std::to_string(w_id) + " AND d_id=" + std::to_string(d_id) + ";");
 
         // 3. customer 余额：c_balance -=, c_ytd_payment +=, c_payment_cnt +=
-        auto rc = SqlClient::parse_rows(cli_->send_sql(
-            "SELECT c_balance, c_ytd_payment, c_payment_cnt FROM customer WHERE c_w_id=" +
-            std::to_string(w_id) + " AND c_d_id=" + std::to_string(d_id) +
-            " AND c_id=" + std::to_string(c_id) + ";"));
-        if (rc.empty()) { cli_->send_sql("ABORT;"); return false; }
-        float c_bal = std::atof(rc[0][0].c_str());
-        float c_ytd = std::atof(rc[0][1].c_str());
-        int   c_cnt = std::atoi(rc[0][2].c_str());
         cli_->send_sql(
-            "UPDATE customer SET c_balance=" + std::to_string(c_bal - amt) +
-            " WHERE c_w_id=" + std::to_string(w_id) +
-            " AND c_d_id=" + std::to_string(d_id) +
-            " AND c_id=" + std::to_string(c_id) + ";");
-        cli_->send_sql(
-            "UPDATE customer SET c_ytd_payment=" + std::to_string(c_ytd + amt) +
-            " WHERE c_w_id=" + std::to_string(w_id) +
-            " AND c_d_id=" + std::to_string(d_id) +
-            " AND c_id=" + std::to_string(c_id) + ";");
-        cli_->send_sql(
-            "UPDATE customer SET c_payment_cnt=" + std::to_string(c_cnt + 1) +
+            "UPDATE customer SET c_balance=c_balance-" + std::to_string(amt) +
+            ", c_ytd_payment=c_ytd_payment+" + std::to_string(amt) +
+            ", c_payment_cnt=c_payment_cnt+1" +
             " WHERE c_w_id=" + std::to_string(w_id) +
             " AND c_d_id=" + std::to_string(d_id) +
             " AND c_id=" + std::to_string(c_id) + ";");
@@ -337,7 +316,6 @@ int main(int argc, char *argv[]) {
 
     uint64_t commit = stats.committed.load();
     uint64_t abort  = stats.aborted.load();
-    uint64_t total  = commit + abort;
     double tps = commit / sec;
 
     std::cout << "\n=========== TPC-C Result ===========\n";

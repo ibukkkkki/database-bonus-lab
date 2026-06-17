@@ -34,12 +34,11 @@ alpha [a-zA-Z]
 digit [0-9]
 white_space [ \t]+
 new_line "\r"|"\n"|"\r\n"
-sign "+"|"-"
 identifier {alpha}(_|{alpha}|{digit})*
-value_int {sign}?{digit}+
-value_float {sign}?{digit}+\.({digit}+)?
+value_int {digit}+
+value_float {digit}+\.({digit}+)?
 value_string '[^']*'
-single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
+single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."|"+"|"-"
 
 %x STATE_COMMENT
 
@@ -71,6 +70,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "DELETE" { return DELETE; }
 "FROM" { return FROM; }
 "WHERE" { return WHERE; }
+"FOR" { return FOR; }
 "UPDATE" { return UPDATE; }
 "SET" { return SET; }
 "SELECT" { return SELECT; }

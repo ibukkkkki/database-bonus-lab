@@ -25,6 +25,17 @@ class UpdateExecutor : public AbstractExecutor {
     std::vector<SetClause> set_clauses_;
     SmManager *sm_manager_;
 
+    bool touches_index(const IndexMeta &index) const {
+        for (auto &set_clause : set_clauses_) {
+            for (auto &col : index.cols) {
+                if (set_clause.lhs.col_name == col.name) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
    public:
     UpdateExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<SetClause> set_clauses,
                    std::vector<Condition> conds, std::vector<Rid> rids, Context *context) {
@@ -38,9 +49,9 @@ class UpdateExecutor : public AbstractExecutor {
         context_ = context;
     }
     std::unique_ptr<RmRecord> Next() override {
-        // 表级 X 锁
+        // 写路径只需要表级 IX；具体冲突由扫描阶段获取的行级 X 锁处理。
         if (context_ != nullptr && context_->lock_mgr_ != nullptr && context_->txn_ != nullptr) {
-            context_->lock_mgr_->lock_exclusive_on_table(context_->txn_, fh_->GetFd());
+            context_->lock_mgr_->lock_IX_on_table(context_->txn_, fh_->GetFd());
         }
         for (auto &rid : rids_) {
             auto rec = fh_->get_record(rid, context_);
@@ -53,6 +64,9 @@ class UpdateExecutor : public AbstractExecutor {
             // 从索引中删除旧的key
             for (size_t i = 0; i < tab_.indexes.size(); ++i) {
                 auto &index = tab_.indexes[i];
+                if (!touches_index(index)) {
+                    continue;
+                }
                 auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
                 char *key = new char[index.col_tot_len];
                 int offset = 0;
@@ -73,12 +87,30 @@ class UpdateExecutor : public AbstractExecutor {
                 if (!val.raw) {
                     val.init_raw(col->len);
                 }
-                memcpy(rec->data + col->offset, val.raw->data, col->len);
+                char *dst = rec->data + col->offset;
+                if (set_clause.op == SetOpType::ASSIGN) {
+                    memcpy(dst, val.raw->data, col->len);
+                } else if (col->type == TYPE_INT) {
+                    int cur = *(int *)dst;
+                    int delta = *(int *)val.raw->data;
+                    int next = set_clause.op == SetOpType::PLUS ? cur + delta : cur - delta;
+                    memcpy(dst, &next, sizeof(int));
+                } else if (col->type == TYPE_FLOAT) {
+                    float cur = *(float *)dst;
+                    float delta = *(float *)val.raw->data;
+                    float next = set_clause.op == SetOpType::PLUS ? cur + delta : cur - delta;
+                    memcpy(dst, &next, sizeof(float));
+                } else {
+                    throw IncompatibleTypeError(coltype2str(col->type), "incremental update");
+                }
             }
             fh_->update_record(rid, rec->data, context_);
             // 向索引中插入新的key
             for (size_t i = 0; i < tab_.indexes.size(); ++i) {
                 auto &index = tab_.indexes[i];
+                if (!touches_index(index)) {
+                    continue;
+                }
                 auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
                 char *key = new char[index.col_tot_len];
                 int offset = 0;

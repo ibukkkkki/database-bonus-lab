@@ -37,9 +37,9 @@ class DeleteExecutor : public AbstractExecutor {
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        // 表级 X 锁
+        // 写路径只需要表级 IX；具体冲突由扫描阶段获取的行级 X 锁处理。
         if (context_ != nullptr && context_->lock_mgr_ != nullptr && context_->txn_ != nullptr) {
-            context_->lock_mgr_->lock_exclusive_on_table(context_->txn_, fh_->GetFd());
+            context_->lock_mgr_->lock_IX_on_table(context_->txn_, fh_->GetFd());
         }
         for (auto &rid : rids_) {
             // 先获取记录数据（用于删除索引、并保存于 write_set 以供回滚）

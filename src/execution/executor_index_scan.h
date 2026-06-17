@@ -16,6 +16,8 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "system/sm.h"
 
+#include <limits>
+
 class IndexScanExecutor : public AbstractExecutor {
    private:
     std::string tab_name_;                      // 表名称
@@ -33,12 +35,16 @@ class IndexScanExecutor : public AbstractExecutor {
     std::unique_ptr<RecScan> scan_;
 
     SmManager *sm_manager_;
+    ScanLockMode lock_mode_;
+    bool use_record_locks_;
 
    public:
     IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, std::vector<std::string> index_col_names,
-                    Context *context) {
+                    Context *context, ScanLockMode lock_mode = ScanLockMode::READ) {
         sm_manager_ = sm_manager;
         context_ = context;
+        lock_mode_ = lock_mode;
+        use_record_locks_ = false;
         tab_name_ = std::move(tab_name);
         tab_ = sm_manager_->db_.get_table(tab_name_);
         conds_ = std::move(conds);
@@ -65,15 +71,7 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void beginTuple() override {
-        // 表级 S 锁：纯读路径加共享锁，让多个只读事务可以并发；
-        // 升级到 X 由后续 update/delete/insert executor 触发。
-        if (context_ != nullptr && context_->lock_mgr_ != nullptr && context_->txn_ != nullptr) {
-            context_->lock_mgr_->lock_shared_on_table(context_->txn_, fh_->GetFd());
-        }
-        // 使用索引条件构建扫描范围
-        auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_)).get();
-
-        // ====== 重写：按索引列顺序拼接多列复合 key ======
+        // ====== 按索引列顺序拼接多列复合 key ======
         // RucBase 的 B+ 树 key 是全量索引列拼接后的字节串；
         // 原实现错误地将单列值当 key 传入，导致多列索引等值查找全部扫不到。
         std::map<std::string, const Condition*> eq_conds;  // col_name -> cond
@@ -119,27 +117,46 @@ class IndexScanExecutor : public AbstractExecutor {
                 memcpy(lower_key.data() + prefix_eq_offset, it_lo->second->rhs_val.raw->data, col.len);
                 use_index_lookup = true;
             } else {
-                memset(lower_key.data() + prefix_eq_offset, 0x00, col.len);
+                fill_bound(lower_key.data() + prefix_eq_offset, col, false);
             }
             if (it_up != upper_conds.end()) {
                 memcpy(upper_key.data() + prefix_eq_offset, it_up->second->rhs_val.raw->data, col.len);
                 use_index_lookup = true;
             } else {
-                memset(upper_key.data() + prefix_eq_offset, 0xFF, col.len);
+                fill_bound(upper_key.data() + prefix_eq_offset, col, true);
             }
             // 剩余列填充边界
             int rest_off = prefix_eq_offset + col.len;
             for (size_t j = i + 1; j < index_col_names_.size(); ++j) {
-                int len = index_meta_.cols[j].len;
-                memset(lower_key.data() + rest_off, 0x00, len);
-                memset(upper_key.data() + rest_off, 0xFF, len);
-                rest_off += len;
+                fill_bound(lower_key.data() + rest_off, index_meta_.cols[j], false);
+                fill_bound(upper_key.data() + rest_off, index_meta_.cols[j], true);
+                rest_off += index_meta_.cols[j].len;
             }
             prefix_eq_offset = -1;  // sentinel
             break;
         }
         // 如果所有列都被等值覆盖，upper 需要使用 upper_bound 语义。
         // 这里统一调用 lower_bound(lower_key) 和 upper_bound(upper_key)。
+        use_record_locks_ = prefix_eq_count == index_col_names_.size();
+
+        if (context_ != nullptr && context_->lock_mgr_ != nullptr && context_->txn_ != nullptr) {
+            if (use_record_locks_) {
+                if (lock_mode_ == ScanLockMode::READ) {
+                    context_->lock_mgr_->lock_IS_on_table(context_->txn_, fh_->GetFd());
+                } else if (lock_mode_ == ScanLockMode::WRITE) {
+                    context_->lock_mgr_->lock_IX_on_table(context_->txn_, fh_->GetFd());
+                }
+            } else {
+                if (lock_mode_ == ScanLockMode::READ) {
+                    context_->lock_mgr_->lock_shared_on_table(context_->txn_, fh_->GetFd());
+                } else if (lock_mode_ == ScanLockMode::WRITE) {
+                    context_->lock_mgr_->lock_exclusive_on_table(context_->txn_, fh_->GetFd());
+                }
+            }
+        }
+
+        // 使用索引条件构建扫描范围
+        auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_)).get();
 
         Iid lower = ih->leaf_begin();
         Iid upper = ih->leaf_end();
@@ -159,6 +176,7 @@ class IndexScanExecutor : public AbstractExecutor {
         // 找到第一个满足所有条件的元组
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
+            lock_record(rid_);
             auto rec = fh_->get_record(rid_, context_);
             if (eval_conds(cols_, fed_conds_, rec.get())) {
                 break;
@@ -170,6 +188,7 @@ class IndexScanExecutor : public AbstractExecutor {
     void nextTuple() override {
         for (scan_->next(); !scan_->is_end(); scan_->next()) {
             rid_ = scan_->rid();
+            lock_record(rid_);
             auto rec = fh_->get_record(rid_, context_);
             if (eval_conds(cols_, fed_conds_, rec.get())) {
                 break;
@@ -188,6 +207,18 @@ class IndexScanExecutor : public AbstractExecutor {
     const std::vector<ColMeta> &cols() const override { return cols_; }
 
 private:
+    void fill_bound(char *dest, const ColMeta &col, bool high) {
+        if (col.type == TYPE_INT) {
+            int value = high ? std::numeric_limits<int>::max() : std::numeric_limits<int>::min();
+            memcpy(dest, &value, sizeof(int));
+        } else if (col.type == TYPE_FLOAT) {
+            float value = high ? std::numeric_limits<float>::max() : -std::numeric_limits<float>::max();
+            memcpy(dest, &value, sizeof(float));
+        } else {
+            memset(dest, high ? 0xFF : 0x00, col.len);
+        }
+    }
+
     // 判断单个条件是否满足
     bool eval_cond(const std::vector<ColMeta> &rec_cols, const Condition &cond, const RmRecord *rec) {
         auto lhs_col = get_col(rec_cols, cond.lhs_col);
@@ -239,6 +270,17 @@ private:
             if (!eval_cond(rec_cols, cond, rec)) return false;
         }
         return true;
+    }
+
+    void lock_record(const Rid &rid) {
+        if (!use_record_locks_ || context_ == nullptr || context_->lock_mgr_ == nullptr || context_->txn_ == nullptr) {
+            return;
+        }
+        if (lock_mode_ == ScanLockMode::READ) {
+            context_->lock_mgr_->lock_shared_on_record(context_->txn_, rid, fh_->GetFd());
+        } else if (lock_mode_ == ScanLockMode::WRITE) {
+            context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
+        }
     }
 
     Rid &rid() override { return rid_; }

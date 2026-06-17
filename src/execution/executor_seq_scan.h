@@ -29,9 +29,11 @@ class SeqScanExecutor : public AbstractExecutor {
     std::unique_ptr<RecScan> scan_;     // table_iterator
 
     SmManager *sm_manager_;
+    ScanLockMode lock_mode_;
 
    public:
-    SeqScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, Context *context) {
+    SeqScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, Context *context,
+                    ScanLockMode lock_mode = ScanLockMode::READ) {
         sm_manager_ = sm_manager;
         tab_name_ = std::move(tab_name);
         conds_ = std::move(conds);
@@ -41,6 +43,7 @@ class SeqScanExecutor : public AbstractExecutor {
         len_ = cols_.back().offset + cols_.back().len;
 
         context_ = context;
+        lock_mode_ = lock_mode;
 
         fed_conds_ = conds_;
     }
@@ -50,12 +53,12 @@ class SeqScanExecutor : public AbstractExecutor {
      *
      */
     void beginTuple() override {
-        // 表级 S 锁：纯读路径加共享锁，让多个只读事务可以并发，
-        // 同时与并发的 UPDATE/DELETE/INSERT（X 锁）保持互斥；
-        // 若同一事务后续走到 update/delete/insert，会触发 S→X 升级，
-        // lock_manager 已对升级冲突走死锁预防（abort）。
         if (context_ != nullptr && context_->lock_mgr_ != nullptr && context_->txn_ != nullptr) {
-            context_->lock_mgr_->lock_shared_on_table(context_->txn_, fh_->GetFd());
+            if (lock_mode_ == ScanLockMode::READ) {
+                context_->lock_mgr_->lock_shared_on_table(context_->txn_, fh_->GetFd());
+            } else if (lock_mode_ == ScanLockMode::WRITE) {
+                context_->lock_mgr_->lock_exclusive_on_table(context_->txn_, fh_->GetFd());
+            }
         }
         scan_ = std::make_unique<RmScan>(fh_);
         // 找到第一个满足谓词条件的元组

@@ -138,7 +138,7 @@ class DMLPlan : public Plan
     public:
         DMLPlan(PlanTag tag, std::shared_ptr<Plan> subplan,std::string tab_name,
                 std::vector<Value> values, std::vector<Condition> conds,
-                std::vector<SetClause> set_clauses)
+                std::vector<SetClause> set_clauses, bool for_update = false)
         {
             Plan::tag = tag;
             subplan_ = std::move(subplan);
@@ -146,6 +146,7 @@ class DMLPlan : public Plan
             values_ = std::move(values);
             conds_ = std::move(conds);
             set_clauses_ = std::move(set_clauses);
+            for_update_ = for_update;
         }
         ~DMLPlan(){}
         std::shared_ptr<Plan> subplan_;
@@ -153,6 +154,7 @@ class DMLPlan : public Plan
         std::vector<Value> values_;
         std::vector<Condition> conds_;
         std::vector<SetClause> set_clauses_;
+        bool for_update_;
 };
 
 // ddl语句, 包括create/drop table; create/drop index;

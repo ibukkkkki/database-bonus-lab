@@ -367,7 +367,7 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
     if (is_empty()) {
         IxNodeHandle *new_root = create_node();
         new_root->page_hdr->is_leaf = true;
-        new_root->insert_pair(0, key, &value, 1);
+        new_root->insert_pair(0, key, value);
         update_root_page_no(new_root->get_page_no());
         file_hdr_->first_leaf_ = new_root->get_page_no();
         file_hdr_->last_leaf_ = new_root->get_page_no();

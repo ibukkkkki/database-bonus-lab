@@ -220,3 +220,28 @@ bool LockManager::unlock(Transaction* txn, LockDataId lock_data_id) {
     q.cv_.notify_all();
     return true;
 }
+
+void LockManager::unlock_all(Transaction* txn) {
+    if (txn == nullptr) return;
+
+    std::unique_lock<std::mutex> lk(latch_);
+    auto lock_set = txn->get_lock_set();
+    for (const auto &lock_id : *lock_set) {
+        auto it = lock_table_.find(lock_id);
+        if (it == lock_table_.end()) continue;
+        auto &q = it->second;
+
+        // 删除该事务的所有请求
+        for (auto rit = q.request_queue_.begin(); rit != q.request_queue_.end();) {
+            if (rit->txn_id_ == txn->get_transaction_id()) {
+                rit = q.request_queue_.erase(rit);
+            } else {
+                ++rit;
+            }
+        }
+        q.group_lock_mode_ = recompute_group_lock_mode(q);
+
+        // 唤醒等待者
+        q.cv_.notify_all();
+    }
+}

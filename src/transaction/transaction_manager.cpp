@@ -56,18 +56,8 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     }
 
     // 2. 释放该事务持有的所有锁
-    auto lock_set = txn->get_lock_set();
-    for (const auto &lock_id : *lock_set) {
-        if (lock_id.type_ == LockDataType::RECORD) {
-            lock_manager_->unlock(txn, lock_id);
-        }
-    }
-    for (const auto &lock_id : *lock_set) {
-        if (lock_id.type_ == LockDataType::TABLE) {
-            lock_manager_->unlock(txn, lock_id);
-        }
-    }
-    lock_set->clear();
+    lock_manager_->unlock_all(txn);
+    txn->get_lock_set()->clear();
 
     // 3. 更新状态
     txn->set_state(TransactionState::COMMITTED);
@@ -198,18 +188,8 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     }
 
     // 2. 释放锁
-    auto lock_set = txn->get_lock_set();
-    for (const auto &lock_id : *lock_set) {
-        if (lock_id.type_ == LockDataType::RECORD) {
-            lock_manager_->unlock(txn, lock_id);
-        }
-    }
-    for (const auto &lock_id : *lock_set) {
-        if (lock_id.type_ == LockDataType::TABLE) {
-            lock_manager_->unlock(txn, lock_id);
-        }
-    }
-    lock_set->clear();
+    lock_manager_->unlock_all(txn);
+    txn->get_lock_set()->clear();
 
     // 3. 更新状态
     txn->set_state(TransactionState::ABORTED);

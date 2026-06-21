@@ -56,6 +56,7 @@ public:
 
     // ===== 释放：被 TransactionManager 在 commit/abort 末尾调用 =====
     bool unlock(Transaction* txn, LockDataId lock_data_id);
+    void unlock_all(Transaction* txn);
 
     // ===== 兼容旧接口：现已 no-op，事务并发由 lock_table_ 管 =====
     void global_lock()   { /* no-op */ }

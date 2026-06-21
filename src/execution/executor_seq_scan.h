@@ -30,6 +30,7 @@ class SeqScanExecutor : public AbstractExecutor {
 
     SmManager *sm_manager_;
     ScanLockMode lock_mode_;
+    std::unique_ptr<RmRecord> current_rec_;
 
    public:
     SeqScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, Context *context,
@@ -64,12 +65,13 @@ class SeqScanExecutor : public AbstractExecutor {
         // 找到第一个满足谓词条件的元组
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
-            auto rec = fh_->get_record(rid_, context_);
-            if (eval_conds(cols_, fed_conds_, rec.get())) {
-                break;
+            current_rec_ = fh_->get_record(rid_, context_);
+            if (eval_conds(cols_, fed_conds_, current_rec_.get())) {
+                return;
             }
             scan_->next();
         }
+        current_rec_ = nullptr;
     }
 
     /**
@@ -80,11 +82,12 @@ class SeqScanExecutor : public AbstractExecutor {
         // 从当前scan_指向的记录开始迭代扫描
         for (scan_->next(); !scan_->is_end(); scan_->next()) {
             rid_ = scan_->rid();
-            auto rec = fh_->get_record(rid_, context_);
-            if (eval_conds(cols_, fed_conds_, rec.get())) {
-                break;
+            current_rec_ = fh_->get_record(rid_, context_);
+            if (eval_conds(cols_, fed_conds_, current_rec_.get())) {
+                return;
             }
         }
+        current_rec_ = nullptr;
     }
 
     /**
@@ -93,6 +96,9 @@ class SeqScanExecutor : public AbstractExecutor {
      * @return std::unique_ptr<RmRecord>
      */
     std::unique_ptr<RmRecord> Next() override {
+        if (current_rec_) {
+            return std::move(current_rec_);
+        }
         return fh_->get_record(rid_, context_);
     }
 

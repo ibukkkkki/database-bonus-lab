@@ -22,24 +22,43 @@ RmScan::RmScan(const RmFileHandle *file_handle) : file_handle_(file_handle) {
     next();
 }
 
+RmScan::~RmScan() {
+    if (cached_page_no_ != -1) {
+        file_handle_->buffer_pool_manager_->unpin_page({file_handle_->fd_, cached_page_no_}, false);
+    }
+}
+
 /**
  * @brief 找到文件中下一个存放了记录的位置
  */
 void RmScan::next() {
     // 找到文件中下一个存放了记录的非空闲位置，用rid_来指向这个位置
     while (rid_.page_no < file_handle_->file_hdr_.num_pages) {
-        RmPageHandle page_handle = file_handle_->fetch_page_handle(rid_.page_no);
-        rid_.slot_no = Bitmap::next_bit(true, page_handle.bitmap, file_handle_->file_hdr_.num_records_per_page, rid_.slot_no);
-        file_handle_->buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
+        if (rid_.page_no != cached_page_no_) {
+            if (cached_page_no_ != -1) {
+                file_handle_->buffer_pool_manager_->unpin_page({file_handle_->fd_, cached_page_no_}, false);
+            }
+            RmPageHandle page_handle = file_handle_->fetch_page_handle(rid_.page_no);
+            cached_page_ = page_handle.page;
+            cached_bitmap_ = page_handle.bitmap;
+            cached_page_no_ = rid_.page_no;
+        }
+        rid_.slot_no = Bitmap::next_bit(true, cached_bitmap_, file_handle_->file_hdr_.num_records_per_page, rid_.slot_no);
         if (rid_.slot_no < file_handle_->file_hdr_.num_records_per_page) {
-            // 找到了一个有记录的slot
+            // 找到了一个有记录的slot，保持当前页的 pin 状态返回
             return;
         }
         // 当前页没有更多记录，跳到下一页
         rid_.slot_no = -1;
         rid_.page_no++;
     }
-    // 到达文件末尾
+    // 到达文件末尾，释放最后一页
+    if (cached_page_no_ != -1) {
+        file_handle_->buffer_pool_manager_->unpin_page({file_handle_->fd_, cached_page_no_}, false);
+        cached_page_no_ = -1;
+        cached_page_ = nullptr;
+        cached_bitmap_ = nullptr;
+    }
     rid_ = Rid{RM_NO_PAGE, -1};
 }
 

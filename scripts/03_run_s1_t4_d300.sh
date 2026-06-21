@@ -22,7 +22,8 @@
 #   * "看见 abort 是不是 bug？"——不是。当前已是 S/X 表锁 + no-wait 死锁预防，
 #     scale=1 + t=4 下少量 abort 属正常死锁规避，不影响数据正确性。
 # ============================================================================
-set -euo pipefail
+set -eu
+set -o pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=$ROOT/build/bin
@@ -74,7 +75,7 @@ fi
 # ---------- 2. 秒级回滚 ----------
 log "用 golden 还原 $DB ($(du -sh "$GOLDEN" | cut -f1)) ..."
 rm -rf "$DB"
-cp -a "$GOLDEN" "$DB"
+cp -r "$GOLDEN" "$DB"
 
 # ---------- 3. 起 server ----------
 log "starting rmdb ..."

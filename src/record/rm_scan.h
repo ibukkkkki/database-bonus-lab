@@ -17,8 +17,13 @@ class RmFileHandle;
 class RmScan : public RecScan {
     const RmFileHandle *file_handle_;
     Rid rid_;
+    int cached_page_no_ = -1;
+    Page* cached_page_ = nullptr;
+    char* cached_bitmap_ = nullptr;
 public:
     RmScan(const RmFileHandle *file_handle);
+    
+    virtual ~RmScan() override;
 
     void next() override;
 

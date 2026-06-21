@@ -16,7 +16,8 @@
 #   bash scripts/02_run_s10_t4_d60.sh                # 默认 t=4 / d=60
 #   T=8 D=120 bash scripts/02_run_s10_t4_d60.sh      # 临时改参数
 # ============================================================================
-set -euo pipefail
+set -eu
+set -o pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=$ROOT/build/bin
@@ -68,7 +69,7 @@ fi
 # ---------- 2. 秒级回滚 ----------
 log "用 golden 还原 $DB ..."
 rm -rf "$DB"
-cp -a "$GOLDEN" "$DB"
+cp -r "$GOLDEN" "$DB"
 
 # ---------- 3. 起 server ----------
 log "starting rmdb ..."

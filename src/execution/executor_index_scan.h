@@ -37,8 +37,10 @@ class IndexScanExecutor : public AbstractExecutor {
     SmManager *sm_manager_;
     ScanLockMode lock_mode_;
     bool use_record_locks_;
+    std::unique_ptr<RmRecord> current_rec_;
 
    public:
+
     IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, std::vector<std::string> index_col_names,
                     Context *context, ScanLockMode lock_mode = ScanLockMode::READ) {
         sm_manager_ = sm_manager;
@@ -177,26 +179,31 @@ class IndexScanExecutor : public AbstractExecutor {
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
             lock_record(rid_);
-            auto rec = fh_->get_record(rid_, context_);
-            if (eval_conds(cols_, fed_conds_, rec.get())) {
-                break;
+            current_rec_ = fh_->get_record(rid_, context_);
+            if (eval_conds(cols_, fed_conds_, current_rec_.get())) {
+                return;
             }
             scan_->next();
         }
+        current_rec_ = nullptr;
     }
 
     void nextTuple() override {
         for (scan_->next(); !scan_->is_end(); scan_->next()) {
             rid_ = scan_->rid();
             lock_record(rid_);
-            auto rec = fh_->get_record(rid_, context_);
-            if (eval_conds(cols_, fed_conds_, rec.get())) {
-                break;
+            current_rec_ = fh_->get_record(rid_, context_);
+            if (eval_conds(cols_, fed_conds_, current_rec_.get())) {
+                return;
             }
         }
+        current_rec_ = nullptr;
     }
 
     std::unique_ptr<RmRecord> Next() override {
+        if (current_rec_) {
+            return std::move(current_rec_);
+        }
         return fh_->get_record(rid_, context_);
     }
 

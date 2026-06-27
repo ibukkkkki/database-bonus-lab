@@ -11,12 +11,6 @@ See the Mulan PSL v2 for more details. */
 #include "lock_manager.h"
 #include "transaction/txn_defs.h"
 
-#include <chrono>
-
-namespace {
-constexpr auto LOCK_YOUNG_TXN_WAIT = std::chrono::milliseconds(2);
-}
-
 bool LockManager::lock_shared_on_record(Transaction* txn, const Rid& rid, int tab_fd) {
     lock_IS_on_table(txn, tab_fd);
     return lock(txn, LockDataId(tab_fd, rid, LockDataType::RECORD), LockMode::SHARED);
@@ -92,6 +86,82 @@ bool LockManager::should_abort_by_wait_die(const LockRequestQueue& queue, Transa
     return false;
 }
 
+bool LockManager::should_abort_by_wait_die(const LockRequestQueue& queue, Transaction* txn,
+                                           LockMode requested,
+                                           std::list<LockRequest>::const_iterator request) const {
+    for (auto it = queue.request_queue_.begin(); it != queue.request_queue_.end(); ++it) {
+        if (it->txn_id_ == txn->get_transaction_id()) {
+            continue;
+        }
+        if (!it->granted_ && it == request) {
+            continue;
+        }
+        if (it->granted_ || it == queue.request_queue_.begin() ||
+            (!it->granted_ && it->start_ts_ < txn->get_start_ts())) {
+            if (!is_compatible(it->lock_mode_, requested) &&
+                txn->get_start_ts() >= it->start_ts_) {
+                return true;
+            }
+        }
+        if (it == request) {
+            break;
+        }
+    }
+    if (queue.upgrading_txn_ != INVALID_TXN_ID &&
+        queue.upgrading_txn_ != txn->get_transaction_id()) {
+        for (const auto &req : queue.request_queue_) {
+            if (req.txn_id_ == queue.upgrading_txn_ &&
+                !is_compatible(queue.upgrading_mode_, requested) &&
+                txn->get_start_ts() >= req.start_ts_) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool LockManager::can_grant_request(const LockRequestQueue& queue,
+                                    std::list<LockRequest>::const_iterator request) const {
+    for (auto it = queue.request_queue_.begin(); it != queue.request_queue_.end(); ++it) {
+        if (it == request) {
+            break;
+        }
+        if (it->txn_id_ == request->txn_id_) {
+            continue;
+        }
+        if (!is_compatible(it->lock_mode_, request->lock_mode_)) {
+            return false;
+        }
+    }
+    for (auto it = request; it != queue.request_queue_.end(); ++it) {
+        if (it == request || !it->granted_ || it->txn_id_ == request->txn_id_) {
+            continue;
+        }
+        if (!is_compatible(it->lock_mode_, request->lock_mode_)) {
+            return false;
+        }
+    }
+    if (queue.upgrading_txn_ != INVALID_TXN_ID &&
+        queue.upgrading_txn_ != request->txn_id_ &&
+        !is_compatible(queue.upgrading_mode_, request->lock_mode_)) {
+        return false;
+    }
+    return true;
+}
+
+bool LockManager::can_grant_upgrade(const LockRequestQueue& queue, txn_id_t txn_id,
+                                    LockMode requested) const {
+    for (const auto &req : queue.request_queue_) {
+        if (!req.granted_ || req.txn_id_ == txn_id) {
+            continue;
+        }
+        if (!is_compatible(req.lock_mode_, requested)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 LockManager::LockMode LockManager::upgrade_mode(LockMode held, LockMode requested) const {
     if (held == requested || held == LockMode::EXLUCSIVE) {
         return held;
@@ -161,40 +231,46 @@ bool LockManager::lock(Transaction* txn, const LockDataId& lock_data_id, LockMod
         if (upgraded == self->lock_mode_) {
             return true;
         }
-        while (!is_compatible_with_granted(q, txn->get_transaction_id(), upgraded)) {
-            if (should_abort_by_wait_die(q, txn, upgraded)) {
-                q.cv_.wait_for(lk, LOCK_YOUNG_TXN_WAIT);
-                if (!is_compatible_with_granted(q, txn->get_transaction_id(), upgraded) &&
-                    should_abort_by_wait_die(q, txn, upgraded)) {
-                    throw TransactionAbortException(txn->get_transaction_id(),
-                                                    AbortReason::DEADLOCK_PREVENTION);
-                }
-            } else {
-                q.cv_.wait(lk);
-            }
+        if (q.upgrading_txn_ != INVALID_TXN_ID &&
+            q.upgrading_txn_ != txn->get_transaction_id()) {
+            throw TransactionAbortException(txn->get_transaction_id(),
+                                            AbortReason::UPGRADE_CONFLICT);
         }
-        self->lock_mode_ = upgraded;
-        q.group_lock_mode_ = recompute_group_lock_mode(q);
-        return true;
-    }
-
-    while (!is_compatible_with_granted(q, txn->get_transaction_id(), mode)) {
-        if (should_abort_by_wait_die(q, txn, mode)) {
-            q.cv_.wait_for(lk, LOCK_YOUNG_TXN_WAIT);
-            if (!is_compatible_with_granted(q, txn->get_transaction_id(), mode) &&
-                should_abort_by_wait_die(q, txn, mode)) {
+        q.upgrading_txn_ = txn->get_transaction_id();
+        q.upgrading_mode_ = upgraded;
+        while (!can_grant_upgrade(q, txn->get_transaction_id(), upgraded)) {
+            if (should_abort_by_wait_die(q, txn, upgraded)) {
+                q.upgrading_txn_ = INVALID_TXN_ID;
+                q.cv_.notify_all();
                 throw TransactionAbortException(txn->get_transaction_id(),
                                                 AbortReason::DEADLOCK_PREVENTION);
             }
-        } else {
             q.cv_.wait(lk);
         }
+        self->lock_mode_ = upgraded;
+        q.upgrading_txn_ = INVALID_TXN_ID;
+        q.group_lock_mode_ = recompute_group_lock_mode(q);
+        q.cv_.notify_all();
+        return true;
     }
 
     q.request_queue_.emplace_back(txn->get_transaction_id(), txn->get_start_ts(), mode);
-    q.request_queue_.back().granted_ = true;
+    auto request = std::prev(q.request_queue_.end());
+    while (!can_grant_request(q, request)) {
+        if (should_abort_by_wait_die(q, txn, mode, request)) {
+            q.request_queue_.erase(request);
+            q.group_lock_mode_ = recompute_group_lock_mode(q);
+            q.cv_.notify_all();
+            throw TransactionAbortException(txn->get_transaction_id(),
+                                            AbortReason::DEADLOCK_PREVENTION);
+        }
+        q.cv_.wait(lk);
+    }
+
+    request->granted_ = true;
     q.group_lock_mode_ = recompute_group_lock_mode(q);
     txn->get_lock_set()->insert(lock_data_id);
+    q.cv_.notify_all();
     return true;
 }
 
@@ -213,6 +289,9 @@ bool LockManager::unlock(Transaction* txn, LockDataId lock_data_id) {
         } else {
             ++rit;
         }
+    }
+    if (q.upgrading_txn_ == txn->get_transaction_id()) {
+        q.upgrading_txn_ = INVALID_TXN_ID;
     }
     q.group_lock_mode_ = recompute_group_lock_mode(q);
 
@@ -238,6 +317,9 @@ void LockManager::unlock_all(Transaction* txn) {
             } else {
                 ++rit;
             }
+        }
+        if (q.upgrading_txn_ == txn->get_transaction_id()) {
+            q.upgrading_txn_ = INVALID_TXN_ID;
         }
         q.group_lock_mode_ = recompute_group_lock_mode(q);
 

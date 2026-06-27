@@ -36,6 +36,8 @@ public:
     public:
         std::list<LockRequest> request_queue_;
         std::condition_variable cv_;
+        txn_id_t upgrading_txn_ = INVALID_TXN_ID;
+        LockMode upgrading_mode_ = LockMode::SHARED;
         // 当前已授予的锁的组模式：NON_LOCK / IS / IX / S / X / SIX
         GroupLockMode group_lock_mode_ = GroupLockMode::NON_LOCK;
     };
@@ -69,6 +71,10 @@ private:
     bool is_compatible(LockMode granted, LockMode requested) const;
     bool is_compatible_with_granted(const LockRequestQueue& queue, txn_id_t txn_id, LockMode requested) const;
     bool should_abort_by_wait_die(const LockRequestQueue& queue, Transaction* txn, LockMode requested) const;
+    bool should_abort_by_wait_die(const LockRequestQueue& queue, Transaction* txn, LockMode requested,
+                                  std::list<LockRequest>::const_iterator request) const;
+    bool can_grant_request(const LockRequestQueue& queue, std::list<LockRequest>::const_iterator request) const;
+    bool can_grant_upgrade(const LockRequestQueue& queue, txn_id_t txn_id, LockMode requested) const;
     LockMode upgrade_mode(LockMode held, LockMode requested) const;
     GroupLockMode recompute_group_lock_mode(const LockRequestQueue& queue) const;
 
